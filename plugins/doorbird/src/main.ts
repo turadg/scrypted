@@ -34,6 +34,13 @@ import {ApiMotionEvent, ApiRingEvent, DoorbirdAPI} from "./doorbird-api";
 
 const {deviceManager, mediaManager} = sdk;
 
+// The Doorbird client addresses the station as scheme://host, so the HTTP port override
+// has to be carried in the host rather than passed separately.
+function toDoorbirdHost(ip: string | null | undefined, httpPort?: string | null) {
+    const host = ip ?? '';
+    return httpPort ? `${host}:${httpPort}` : host;
+}
+
 // Separator used to build the native id of a relay child device, e.g. 'a1b2c3d4-relay-ghdoor1@1'.
 const RELAY_NATIVE_ID_SEPARATOR = '-relay-';
 // Doorbird stations always ship with at least one on board relay. Older firmware does not
@@ -106,7 +113,7 @@ class DoorbirdCamera extends ScryptedDeviceBase implements Intercom, Camera, Vid
             return undefined;
 
         if (!this.doorbirdApi) {
-            this.doorbirdApi = new DoorbirdAPI(this.getIPAddress(), this.getUsername(), this.getPassword(), this.console);
+            this.doorbirdApi = new DoorbirdAPI(this.getHost(), this.getUsername(), this.getPassword(), this.console);
 
             this.getDoorbirdApi()?.registerRingCallback((event: ApiRingEvent) => {
                 this.console?.log("Ring event");
@@ -688,7 +695,16 @@ class DoorbirdCamera extends ScryptedDeviceBase implements Intercom, Camera, Vid
     }
 
     getHttpBaseAddress() {
-        return `http://${this.getUsername()}:${this.getPassword()}@${this.getIPAddress()}:${this.storage.getItem('httpPort') || 80}`;
+        return `http://${this.getUsername()}:${this.getPassword()}@${this.getIPAddress()}:${this.getHttpPortOverride() || 80}`;
+    }
+
+    getHttpPortOverride() {
+        return this.storage.getItem('httpPort');
+    }
+
+    // Host as the Doorbird HTTP API client addresses it, including the port override.
+    getHost() {
+        return toDoorbirdHost(this.getIPAddress(), this.getHttpPortOverride());
     }
 
     getRtspAddress() {
@@ -796,7 +812,7 @@ export class DoorbirdCamProvider extends ScryptedDeviceBase implements DevicePro
         const skipValidate = settings.skipValidate === 'true';
 
         if (!skipValidate) {
-            const api = new DoorbirdAPI(host, username, password, this.console);
+            const api = new DoorbirdAPI(toDoorbirdHost(host, settings.httpPort?.toString()), username, password, this.console);
             try {
                 const deviceInfo = await api.getInfo();
 

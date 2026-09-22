@@ -5,12 +5,15 @@ import {readLength, StreamEndError} from "@scrypted/common/src/read-stream";
 import sdk, {
     BinarySensor,
     Camera,
+    Device,
     DeviceCreator,
     DeviceCreatorSettings,
     DeviceInformation,
     DeviceProvider,
     FFmpegInput,
     Intercom,
+    Lock,
+    LockState,
     MediaObject,
     MotionSensor,
     PictureOptions,
@@ -31,7 +34,51 @@ import {ApiMotionEvent, ApiRingEvent, DoorbirdAPI} from "./doorbird-api";
 
 const {deviceManager, mediaManager} = sdk;
 
-class DoorbirdCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCamera, Settings, BinarySensor, MotionSensor {
+// Separator used to build the native id of a relay child device, e.g. 'a1b2c3d4-relay-ghdoor1@1'.
+const RELAY_NATIVE_ID_SEPARATOR = '-relay-';
+// Doorbird stations always ship with at least one on board relay. Older firmware does not
+// report the RELAYS array in info.cgi, so fall back to that one.
+const DEFAULT_RELAYS = ['1'];
+const DEFAULT_RELOCK_DELAY_SECONDS = 5;
+
+// A single Doorbird relay, exposed as a lock. Doorbird relays are momentary: the station
+// closes the contact for the duration configured in its own settings, which is what an
+// electric door strike expects. There is no way to read the relay back, so the lock state
+// is a local approximation that returns to Locked once the strike has had time to fall shut.
+class DoorbirdLock extends ScryptedDeviceBase implements Lock {
+    relockTimeout?: NodeJS.Timeout;
+
+    constructor(nativeId: string, public camera: DoorbirdCamera, public relay: string) {
+        super(nativeId);
+        // The relay cannot be held closed across a restart, so the strike is known to be
+        // shut whichever state was persisted.
+        this.lockState = LockState.Locked;
+    }
+
+    async lock(): Promise<void> {
+        // The relay releases on its own, so there is nothing to send to the station.
+        clearTimeout(this.relockTimeout);
+        this.relockTimeout = undefined;
+        this.lockState = LockState.Locked;
+    }
+
+    async unlock(): Promise<void> {
+        const doorbirdApi = this.camera.getDoorbirdApi();
+        if (!doorbirdApi)
+            throw new Error('Doorbird: camera is not configured.');
+
+        await doorbirdApi.openRelay(this.relay);
+
+        this.lockState = LockState.Unlocked;
+        clearTimeout(this.relockTimeout);
+        this.relockTimeout = setTimeout(() => {
+            this.relockTimeout = undefined;
+            this.lockState = LockState.Locked;
+        }, this.camera.getRelockDelay() * 1000);
+    }
+}
+
+class DoorbirdCamera extends ScryptedDeviceBase implements Intercom, Camera, VideoCamera, Settings, BinarySensor, MotionSensor, DeviceProvider {
     doorbirdApi: DoorbirdAPI | undefined;
     binarySensorTimeout: NodeJS.Timeout;
     motionSensorTimeout: NodeJS.Timeout;
@@ -41,6 +88,7 @@ class DoorbirdCamera extends ScryptedDeviceBase implements Intercom, Camera, Vid
     audioSilenceProcess: ChildProcess;
     audioRXClientSocket: net.Socket;
     pendingPicture: Promise<MediaObject>;
+    locks = new Map<string, DoorbirdLock>();
 
     private static readonly TRANSMIT_AUDIO_CHUNK_SIZE: number = 256;
 
@@ -86,11 +134,66 @@ class DoorbirdCamera extends ScryptedDeviceBase implements Intercom, Camera, Vid
             ip
         };
 
-        const response = await this.getDoorbirdApi()?.getInfo();
+        let response: any;
+        try {
+            response = await this.getDoorbirdApi()?.getInfo();
+        } catch (e) {
+            this.console.error('Doorbird: failed to retrieve device info', e);
+            return;
+        }
 
         deviceInfo.firmware = response.firmwareVersion + '-' + response.buildNumber;
 
         this.info = deviceInfo;
+
+        await this.updateRelayDevices(response.relays);
+    }
+
+    // Report one lock device per relay the station advertises. Relay ids are opaque strings:
+    // '1' and '2' for the on board relays, 'ghdoor1@1' and the like for peripheral controllers.
+    async updateRelayDevices(relays: string[]): Promise<void> {
+        if (!relays?.length)
+            relays = DEFAULT_RELAYS;
+
+        const devices: Device[] = relays.map(relay => ({
+            providerNativeId: this.nativeId,
+            nativeId: this.getRelayNativeId(relay),
+            name: relays.length > 1 ? `${this.name || 'Doorbird'} Relay ${relay}` : `${this.name || 'Doorbird'} Door`,
+            type: ScryptedDeviceType.Lock,
+            interfaces: [ScryptedInterface.Lock],
+            info: {...this.info},
+        }));
+
+        await deviceManager.onDevicesChanged({
+            providerNativeId: this.nativeId,
+            devices,
+        });
+
+        // Forget locks for relays the station no longer reports.
+        for (const nativeId of [...this.locks.keys()]) {
+            if (!devices.some(device => device.nativeId === nativeId))
+                this.locks.delete(nativeId);
+        }
+    }
+
+    getRelayNativeId(relay: string) {
+        return `${this.nativeId}${RELAY_NATIVE_ID_SEPARATOR}${relay}`;
+    }
+
+    async getDevice(nativeId: string): Promise<any> {
+        let lock = this.locks.get(nativeId);
+        if (!lock) {
+            const index = nativeId.indexOf(RELAY_NATIVE_ID_SEPARATOR);
+            if (index < 0)
+                return undefined;
+            lock = new DoorbirdLock(nativeId, this, nativeId.substring(index + RELAY_NATIVE_ID_SEPARATOR.length));
+            this.locks.set(nativeId, lock);
+        }
+        return lock;
+    }
+
+    async releaseDevice(id: string, nativeId: string): Promise<void> {
+        this.locks.delete(nativeId);
     }
 
     async takePicture(option?: PictureOptions): Promise<MediaObject> {
@@ -124,6 +227,9 @@ class DoorbirdCamera extends ScryptedDeviceBase implements Intercom, Camera, Vid
         this.onDeviceEvent(ScryptedInterface.Settings, undefined);
 
         this.provider.updateDevice(this.nativeId, this.name);
+
+        // The station may be reachable under new credentials now, so refresh the relay list.
+        this.updateDeviceInfo().catch(e => this.console.error('Doorbird: failed to update device info', e));
     }
 
     async getSettings(): Promise<Setting[]> {
@@ -163,6 +269,15 @@ class DoorbirdCamera extends ScryptedDeviceBase implements Intercom, Camera, Vid
                 placeholder: 'rtsp://192.168.2.100/my_doorbird_video_stream',
                 value: this.storage.getItem('rtspUrl'),
                 description: 'Use this in case you are already using another RTSP server/proxy (e.g. mediamtx, go2rtc, etc.) to limit the number of streams from the camera.',
+            },
+            {
+                key: 'relockDelay',
+                type: 'number',
+                subgroup: 'Advanced',
+                title: 'Relock Delay',
+                placeholder: DEFAULT_RELOCK_DELAY_SECONDS.toString(),
+                value: this.getRelockDelay(),
+                description: 'Seconds before a triggered relay is reported as locked again. Doorbird relays release on their own, so this only controls the reported lock state. Set this to the relay hold time configured on the station.',
             },
             {
                 key: 'audioDenoise',
@@ -604,6 +719,13 @@ class DoorbirdCamera extends ScryptedDeviceBase implements Intercom, Camera, Vid
         return this.storage.getItem('password');
     }
 
+    getRelockDelay(): number {
+        const relockDelay = parseFloat(this.storage.getItem('relockDelay') || '');
+        if (!(relockDelay > 0))
+            return DEFAULT_RELOCK_DELAY_SECONDS;
+        return relockDelay;
+    }
+
     setAudioDenoise(enabled: boolean) {
         this.storage.setItem('audioDenoise', enabled.toString());
     }
@@ -704,6 +826,10 @@ export class DoorbirdCamProvider extends ScryptedDeviceBase implements DevicePro
         device.setAudioDenoise(settings.audioDenoise === 'true');
         device.setAudioSpeechEnhancement(settings.audioSpeechEnhancement === 'true');
 
+        // The IP address is only known now, so this is the first point at which the relays
+        // of the station can be discovered and exposed as locks.
+        await device.updateDeviceInfo();
+
         return nativeId;
     }
 
@@ -748,7 +874,8 @@ export class DoorbirdCamProvider extends ScryptedDeviceBase implements DevicePro
                 ScryptedInterface.Settings,
                 ScryptedInterface.Intercom,
                 ScryptedInterface.BinarySensor,
-                ScryptedInterface.MotionSensor
+                ScryptedInterface.MotionSensor,
+                ScryptedInterface.DeviceProvider
             ],
             type: ScryptedDeviceType.Doorbell,
             info: deviceManager.getNativeIds().includes(nativeId) ? deviceManager.getDeviceState(nativeId)?.info : undefined,

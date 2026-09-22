@@ -87,6 +87,20 @@ export class DoorbirdAPI {
             firmwareVersion: dbInfo.BHA.VERSION[0].FIRMWARE,
             buildNumber: dbInfo.BHA.VERSION[0].BUILD_NUMBER,
             serialNumber: dbInfo.BHA.VERSION[0].WIFI_MAC_ADDR,
+            relays: dbInfo.BHA.VERSION[0].RELAYS ?? [],
         }
+    }
+
+    // Triggers a relay of the Doorbird station, e.g. to release an electric door strike.
+    // Doorbird relays are momentary: the station closes the contact for the duration
+    // configured in its own settings and releases it again without further interaction.
+    async openRelay(relay: string): Promise<void> {
+        this.console?.log("Doorbird: triggering relay", relay);
+        const response = await this.doorbird.toggleRelay(relay);
+        // The Doorbird API reports success as RETURNCODE '1'. Anything else (e.g. '204' for
+        // a user that is not permitted to open doors) leaves the relay untouched.
+        const returnCode = response?.BHA?.RETURNCODE;
+        if (returnCode !== '1')
+            throw new Error(`Doorbird: relay ${relay} was not triggered, RETURNCODE=${returnCode}`);
     }
 }
